@@ -10,23 +10,11 @@ jobs:
   build:
     name: Android64
     runs-on: ubuntu-latest
-
     steps:
       - uses: actions/checkout@v4
 
-      - name: Replace NDK 29 with NDK 27
-        run: |
-          SDK=/usr/local/lib/android/sdk
-          sudo rm -rf $SDK/ndk/29.*
-          yes | sudo $SDK/cmdline-tools/latest/bin/sdkmanager --sdk_root=$SDK "ndk;27.2.12479018" > /dev/null
-          ls $SDK/ndk
-
       - name: Build the mod
         uses: geode-sdk/build-geode-mod@main
-        env:
-          ANDROID_NDK_HOME: /usr/local/lib/android/sdk/ndk/27.2.12479018
-          ANDROID_NDK_ROOT: /usr/local/lib/android/sdk/ndk/27.2.12479018
-          ANDROID_NDK_LATEST_HOME: /usr/local/lib/android/sdk/ndk/27.2.12479018
         with:
           bindings: geode-sdk/bindings
           bindings-ref: main
@@ -37,7 +25,6 @@ jobs:
     name: Package build
     runs-on: ubuntu-latest
     needs: ["build"]
-
     steps:
       - uses: geode-sdk/build-geode-mod/combine@main
         id: build
