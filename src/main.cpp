@@ -186,7 +186,7 @@ class $modify(MacroGJ, GJBaseGameLayer) {
         GJBaseGameLayer::handleButton(down, button, isPlayer1);
     }
 
-    void processCommands(float dt) {
+    void processCommands(float dt, bool isHalfTick, bool isLastTick) {
         auto pl = PlayLayer::get();
         bool playing = M::ready && pl
             && static_cast<GJBaseGameLayer*>(pl) == static_cast<GJBaseGameLayer*>(this)
@@ -206,7 +206,7 @@ class $modify(MacroGJ, GJBaseGameLayer) {
             }
         }
 
-        GJBaseGameLayer::processCommands(dt);
+        GJBaseGameLayer::processCommands(dt, isHalfTick, isLastTick);
 
         // "Die at %": always a failed run, guaranteed
         if (playing && M::dieEnabled && !M::dieDone && !m_player1->m_isDead
