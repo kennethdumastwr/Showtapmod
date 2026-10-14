@@ -285,7 +285,7 @@ class $modify(MacroPL, PlayLayer) {
 };
 
 // ---------------------------------------------------------------- popup
-class MacroPopup : public Popup<> {
+class MacroPopup : public Popup {
 protected:
     CCLabelBMFont* m_modeLabel = nullptr;
     CCLabelBMFont* m_infoLabel = nullptr;
@@ -306,7 +306,8 @@ protected:
         }
     }
 
-    bool setup() override {
+    bool init() {
+        if (!Popup::init(340.f, 290.f)) return false;
         this->setTitle("Percent Macro");
 
         // ---- mode buttons
@@ -424,7 +425,7 @@ protected:
 public:
     static MacroPopup* create() {
         auto ret = new MacroPopup();
-        if (ret->initAnchored(340.f, 290.f)) {
+        if (ret->init()) {
             ret->autorelease();
             return ret;
         }
