@@ -15,9 +15,10 @@ using namespace geode::prelude;
 enum class Mode { Off, Record, Play };
 
 // x = exact player X position (this IS the level percent, just without rounding)
+// stored as double and saved with 25 decimals
 struct Action {
-    float x;
-    float percent;
+    double x;
+    double percent;
     bool down;
     bool p2;
 };
@@ -31,6 +32,7 @@ namespace M {
     inline bool active = true;   // does the macro play on this attempt?
     inline int cycle = 0;        // position in the "play after N attempts" cycle
     inline bool dieDone = false;
+    inline int dieTries = 0;
     inline bool holdP1 = false;
     inline bool holdP2 = false;
     inline std::string levelKey;
@@ -40,8 +42,10 @@ namespace M {
     inline float diePercent = 50.f;
     inline bool skipEnabled = false;
     inline int skipN = 2;
+    inline bool useFolder = false;
+    inline std::string folder;
 
-    constexpr float EPS = 0.001f;
+    constexpr double EPS = 1e-6;
 
     inline int period() { return skipEnabled ? std::max(skipN, 0) + 1 : 1; }
 
@@ -55,28 +59,41 @@ namespace M {
         return "local_" + std::to_string(std::hash<std::string>{}(std::string(lvl->m_levelName)) % 100000000);
     }
 
-    inline std::filesystem::path macroPath() {
-        auto dir = Mod::get()->getSaveDir() / "macros";
+    // folder macros are saved to / loaded from
+    inline std::filesystem::path baseDir() {
         std::error_code ec;
+        std::filesystem::path dir;
+        if (useFolder && !folder.empty()) {
+            dir = std::filesystem::path(folder);
+            std::filesystem::create_directories(dir, ec);
+            if (!ec) return dir;
+        }
+        dir = Mod::get()->getSaveDir() / "macros";
         std::filesystem::create_directories(dir, ec);
-        return dir / (levelKey + ".txt");
+        return dir;
     }
 
-    inline void save() {
-        if (levelKey.empty() || actions.empty()) return;
+    inline std::filesystem::path macroPath() {
+        return baseDir() / (levelKey + ".txt");
+    }
+
+    inline bool save() {
+        if (levelKey.empty() || actions.empty()) return false;
         std::ofstream out(macroPath());
-        if (!out) return;
-        out << "# percent-macro v1: x percent down p2\n" << std::setprecision(9);
+        if (!out) return false;
+        out << "# percent-macro v2: x percent down p2 (25 decimals)\n" << std::fixed << std::setprecision(25);
         for (auto& a : actions) {
             out << a.x << ' ' << a.percent << ' ' << (int)a.down << ' ' << (int)a.p2 << '\n';
         }
+        return true;
     }
 
-    inline void load() {
-        actions.clear();
-        if (levelKey.empty()) return;
+    // returns true if a macro file was found; current macro is untouched otherwise
+    inline bool load() {
+        if (levelKey.empty()) return false;
         std::ifstream in(macroPath());
-        if (!in) return;
+        if (!in) return false;
+        std::vector<Action> loaded;
         std::string line;
         while (std::getline(in, line)) {
             if (line.empty() || line[0] == '#') continue;
@@ -86,9 +103,13 @@ namespace M {
             if (ss >> a.x >> a.percent >> d >> p) {
                 a.down = d != 0;
                 a.p2 = p != 0;
-                actions.push_back(a);
+                loaded.push_back(a);
             }
         }
+        if (loaded.empty()) return false;
+        actions = std::move(loaded);
+        idx = 0;
+        return true;
     }
 
     inline void clearMacro() {
@@ -126,11 +147,12 @@ namespace M {
     // Called after every resetLevel (death, restart, practice-mode respawn)
     inline void onReset(PlayLayer* pl) {
         if (!ready || !pl->m_player1) return;
-        float x = pl->m_player1->getPositionX();
-        float pct = pl->getCurrentPercent();
+        double x = pl->m_player1->getPositionX();
+        double pct = pl->getCurrentPercent();
 
-        // don't instantly re-kill when respawning past the die percent (practice checkpoints)
-        dieDone = pct >= diePercent;
+        dieTries = 0;
+        // only skip the die when respawning from a practice checkpoint that is already past it
+        dieDone = pl->m_isPracticeMode && pct >= diePercent;
 
         if (mode == Mode::Record) {
             // practice mode: throw away everything recorded after the checkpoint we respawned at
@@ -144,7 +166,7 @@ namespace M {
             active = (cycle == 0);
 
             auto it = std::lower_bound(actions.begin(), actions.end(), x - EPS,
-                [](Action const& a, float v) { return a.x < v; });
+                [](Action const& a, double v) { return a.x < v; });
             idx = it - actions.begin();
 
             // if we respawn in the middle of a hold, re-press right away
@@ -176,8 +198,8 @@ class $modify(MacroGJ, GJBaseGameLayer) {
 
             if (M::mode == Mode::Record && m_player1 && !m_player1->m_isDead) {
                 M::actions.push_back({
-                    m_player1->getPositionX(),
-                    pl->getCurrentPercent(),
+                    (double)m_player1->getPositionX(),
+                    (double)pl->getCurrentPercent(),
                     down,
                     !isPlayer1
                 });
@@ -188,13 +210,13 @@ class $modify(MacroGJ, GJBaseGameLayer) {
 
     void processCommands(float dt, bool isHalfTick, bool isLastTick) {
         auto pl = PlayLayer::get();
-        bool playing = M::ready && pl
-            && static_cast<GJBaseGameLayer*>(pl) == static_cast<GJBaseGameLayer*>(this)
-            && M::mode == Mode::Play && M::active && m_player1 && !m_player1->m_isDead;
+        auto self = static_cast<GJBaseGameLayer*>(this);
+        bool inLevel = M::ready && pl && static_cast<GJBaseGameLayer*>(pl) == self
+            && m_player1 && !m_player1->m_isDead;
+        bool playing = inLevel && M::mode == Mode::Play && M::active;
 
         if (playing) {
-            float x = m_player1->getPositionX();
-            auto self = static_cast<GJBaseGameLayer*>(this);
+            double x = m_player1->getPositionX();
 
             if (M::holdP1) { M::holdP1 = false; inject(self, true, false); }
             if (M::holdP2) { M::holdP2 = false; inject(self, true, true); }
@@ -208,11 +230,20 @@ class $modify(MacroGJ, GJBaseGameLayer) {
 
         GJBaseGameLayer::processCommands(dt, isHalfTick, isLastTick);
 
-        // "Die at %": always a failed run, guaranteed
-        if (playing && M::dieEnabled && !M::dieDone && !m_player1->m_isDead
-            && pl->getCurrentPercent() >= M::diePercent) {
-            M::dieDone = true;
+        // "Die at %": works while the macro plays AND when the mode is Off.
+        // Not during Record, and not on the attempts you play yourself (play-after-attempts).
+        bool dieMode = M::mode == Mode::Off || (M::mode == Mode::Play && M::active);
+        if (inLevel && dieMode && M::dieEnabled && !M::dieDone
+            && m_player1 && !m_player1->m_isDead
+            && (double)pl->getCurrentPercent() >= (double)M::diePercent) {
             pl->destroyPlayer(pl->m_player1, pl->m_anticheatSpike);
+            if (m_player1->m_isDead) {
+                M::dieDone = true;
+            } else if (++M::dieTries >= 3) {
+                // kill got blocked somehow - force a restart so the attempt still fails
+                M::dieDone = true;
+                pl->resetLevel();
+            }
         }
     }
 };
@@ -225,12 +256,13 @@ class $modify(MacroPL, PlayLayer) {
 
         M::levelKey = M::keyFor(level);
         if (M::mode == Mode::Record) M::actions.clear();
-        else M::load();
+        else if (!M::load()) M::actions.clear();
 
         M::idx = 0;
         M::cycle = 0;
         M::active = true;
         M::dieDone = false;
+        M::dieTries = 0;
         M::holdP1 = M::holdP2 = false;
         M::ready = true;
 
@@ -263,6 +295,10 @@ class $modify(MacroPL, PlayLayer) {
                 if (M::active) s = fmt::format("PLAY - {}/{}", M::idx, M::actions.size());
                 else s = fmt::format("MACRO - plays in {} attempt(s)", M::period() - M::cycle);
             }
+            if (M::dieEnabled) {
+                if (!s.empty()) s += "  |  ";
+                s += fmt::format("DIE @ {}%", M::diePercent);
+            }
         }
         static std::string last;
         if (s != last) {
@@ -284,7 +320,82 @@ class $modify(MacroPL, PlayLayer) {
     }
 };
 
-// ---------------------------------------------------------------- popup
+// ---------------------------------------------------------------- folder popup
+class FolderPopup : public Popup {
+protected:
+    CCLabelBMFont* m_status = nullptr;
+
+    void setStatus(std::string const& s) {
+        m_status->setString(s.c_str());
+    }
+
+    bool init() {
+        if (!Popup::init(340.f, 210.f)) return false;
+        this->setTitle("Macro Folder");
+
+        auto toggle = CCMenuItemExt::createToggler(
+            CCSprite::createWithSpriteFrameName("GJ_checkOn_001.png"),
+            CCSprite::createWithSpriteFrameName("GJ_checkOff_001.png"),
+            [](CCMenuItemToggler* t) {
+                M::useFolder = !t->isToggled();
+                Mod::get()->setSavedValue("use-folder", M::useFolder);
+            });
+        toggle->setScale(.7f);
+        toggle->toggle(M::useFolder);
+        m_buttonMenu->addChildAtPosition(toggle, Anchor::Center, {-140.f, 48.f});
+
+        auto label = CCLabelBMFont::create("Use this folder to save/load macros", "bigFont.fnt");
+        label->setScale(.35f);
+        label->setAnchorPoint({0.f, .5f});
+        m_mainLayer->addChildAtPosition(label, Anchor::Center, {-120.f, 48.f});
+
+        auto input = TextInput::create(300.f, "/storage/emulated/0/Download/macros", "chatFont.fnt");
+        input->setMaxCharCount(250);
+        input->setString(M::folder, false);
+        input->setCallback([](std::string const& s) {
+            M::folder = s;
+            Mod::get()->setSavedValue("folder", s);
+        });
+        m_mainLayer->addChildAtPosition(input, Anchor::Center, {0.f, 12.f});
+
+        auto saveSpr = ButtonSprite::create("Save now", 100, true, "bigFont.fnt", "GJ_button_01.png", 28.f, .55f);
+        auto saveBtn = CCMenuItemExt::createSpriteExtra(saveSpr, [this](CCObject*) {
+            if (M::levelKey.empty()) { this->setStatus("Open a level first"); return; }
+            bool ok = M::save();
+            this->setStatus(ok ? fmt::format("Saved {} actions", M::actions.size())
+                               : std::string("Nothing to save (or folder not writable)"));
+        });
+        m_buttonMenu->addChildAtPosition(saveBtn, Anchor::Center, {-70.f, -32.f});
+
+        auto loadSpr = ButtonSprite::create("Load now", 100, true, "bigFont.fnt", "GJ_button_02.png", 28.f, .55f);
+        auto loadBtn = CCMenuItemExt::createSpriteExtra(loadSpr, [this](CCObject*) {
+            if (M::levelKey.empty()) { this->setStatus("Open a level first"); return; }
+            bool ok = M::load();
+            this->setStatus(ok ? fmt::format("Loaded {} actions", M::actions.size())
+                               : std::string("No macro found for this level in that folder"));
+        });
+        m_buttonMenu->addChildAtPosition(loadBtn, Anchor::Center, {70.f, -32.f});
+
+        m_status = CCLabelBMFont::create(fmt::format("Folder: {}", M::baseDir().string()).c_str(), "chatFont.fnt");
+        m_status->setScale(.6f);
+        m_status->limitLabelWidth(310.f, .6f, .2f);
+        m_mainLayer->addChildAtPosition(m_status, Anchor::Center, {0.f, -72.f});
+        return true;
+    }
+
+public:
+    static FolderPopup* create() {
+        auto ret = new FolderPopup();
+        if (ret->init()) {
+            ret->autorelease();
+            return ret;
+        }
+        delete ret;
+        return nullptr;
+    }
+};
+
+// ---------------------------------------------------------------- main popup
 class MacroPopup : public Popup {
 protected:
     CCLabelBMFont* m_modeLabel = nullptr;
@@ -393,17 +504,23 @@ protected:
         slider->setValue((M::opacity() - 0.1f) / 0.9f);
         m_mainLayer->addChildAtPosition(slider, Anchor::Center, {0.f, -80.f});
 
-        // ---- clear + info
+        // ---- clear + folder + info
         auto clearSpr = ButtonSprite::create("Clear macro", 110, true, "bigFont.fnt", "GJ_button_06.png", 28.f, .5f);
         auto clearBtn = CCMenuItemExt::createSpriteExtra(clearSpr, [this](CCObject*) {
             M::clearMacro();
             this->refresh();
         });
-        m_buttonMenu->addChildAtPosition(clearBtn, Anchor::Center, {-80.f, -118.f});
+        m_buttonMenu->addChildAtPosition(clearBtn, Anchor::Center, {-115.f, -118.f});
+
+        auto folderSpr = ButtonSprite::create("Folder", 80, true, "bigFont.fnt", "GJ_button_02.png", 28.f, .5f);
+        auto folderBtn = CCMenuItemExt::createSpriteExtra(folderSpr, [](CCObject*) {
+            if (auto p = FolderPopup::create()) p->show();
+        });
+        m_buttonMenu->addChildAtPosition(folderBtn, Anchor::Center, {-30.f, -118.f});
 
         m_infoLabel = CCLabelBMFont::create("", "chatFont.fnt");
         m_infoLabel->setScale(.8f);
-        m_mainLayer->addChildAtPosition(m_infoLabel, Anchor::Center, {80.f, -118.f});
+        m_mainLayer->addChildAtPosition(m_infoLabel, Anchor::Center, {90.f, -118.f});
 
         refresh();
         return true;
@@ -474,4 +591,6 @@ $on_mod(Loaded) {
     M::diePercent = Mod::get()->getSavedValue<float>("die-percent", 50.f);
     M::skipEnabled = Mod::get()->getSavedValue<bool>("skip-enabled", false);
     M::skipN = Mod::get()->getSavedValue<int>("skip-n", 2);
+    M::useFolder = Mod::get()->getSavedValue<bool>("use-folder", false);
+    M::folder = Mod::get()->getSavedValue<std::string>("folder", std::string());
 }
