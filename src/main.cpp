@@ -45,6 +45,8 @@ namespace M {
     inline std::string levelKey;
     inline std::string levelName;
     inline std::string macroName; // name typed by the user (empty = level id)
+    inline std::string nextName;  // macro to play after the skipped attempts
+    inline bool sawSkip = false;  // a "play after attempts" skip happened since the last active attempt
 
     // user options
     inline bool dieEnabled = false;
@@ -98,6 +100,17 @@ namespace M {
 
     inline std::filesystem::path pathFor(std::string const& name) {
         return baseDir() / (name + ".txt");
+    }
+
+    // never overwrite an existing macro by accident: add _2, _3, ... if the name is taken
+    inline std::string uniqueName(std::string const& base) {
+        std::error_code ec;
+        if (!std::filesystem::exists(pathFor(base), ec)) return base;
+        for (int i = 2; i < 10000; i++) {
+            auto c = base + "_" + std::to_string(i);
+            if (!std::filesystem::exists(pathFor(c), ec)) return c;
+        }
+        return base;
     }
 
     inline bool save(std::string const& name) {
@@ -186,16 +199,22 @@ namespace M {
     }
 
     inline void setMode(Mode m) {
-        if (mode == Mode::Record && m != Mode::Record) save();
+        if (mode == Mode::Record) save(); // leaving (or re-arming) a recording saves it first
         mode = m;
         if (m == Mode::Record) {
             actions.clear();
+            // new recording ALWAYS gets its own file - old macros are never overwritten
+            std::string base = sanitize(macroName);
+            if (base.empty()) base = levelKey;
+            auto n = uniqueName(base);
+            macroName = (n == levelKey) ? "" : n;
         }
         if (m == Mode::Play) {
             if (actions.empty()) load(fileBase());
             // macro starts on the NEXT attempt (restart the level)
             cycle = period() - 1;
             active = false;
+            sawSkip = false;
             idx = 0;
             holdP1 = holdP2 = false;
         }
@@ -217,6 +236,23 @@ namespace M {
         Notification::create("Recording finished - saved", NotificationIcon::Success, 2.f)->show();
     }
 
+    // After the skipped attempts: switch to the "then play macro" and turn "die at %" off
+    inline void applyNextMacro() {
+        auto n = sanitize(nextName);
+        if (n.empty()) return;
+        if (fileBase() != n || actions.empty()) {
+            if (!loadFile(n)) {
+                Notification::create(fmt::format("Next macro '{}' not found", n), NotificationIcon::Error, 2.f)->show();
+                return;
+            }
+        }
+        if (dieEnabled) {
+            dieEnabled = false;
+            Mod::get()->setSavedValue("die-enabled", false);
+            Notification::create("Die at % turned off for the next macro", NotificationIcon::Success, 2.f)->show();
+        }
+    }
+
     // Called after every resetLevel (death, restart, practice-mode respawn)
     inline void onReset(PlayLayer* pl) {
         if (!ready || !pl->m_player1) return;
@@ -236,6 +272,12 @@ namespace M {
         } else if (mode == Mode::Play) {
             cycle = (cycle + 1) % period();
             active = (cycle == 0);
+            if (!active) {
+                sawSkip = true;
+            } else if (sawSkip) {
+                sawSkip = false;
+                applyNextMacro();
+            }
 
             auto it = std::lower_bound(actions.begin(), actions.end(), x - EPS,
                 [](Action const& a, double v) { return a.x < v; });
@@ -340,6 +382,7 @@ class $modify(MacroPL, PlayLayer) {
         M::idx = 0;
         M::cycle = 0;
         M::active = true;
+        M::sawSkip = false;
         M::failed = false;
         M::held[0] = M::held[1] = false;
         M::holdP1 = M::holdP2 = false;
@@ -570,8 +613,10 @@ protected:
         auto saveBtn = CCMenuItemExt::createSpriteExtra(saveSpr, [this](CCObject*) {
             if (M::levelKey.empty()) { this->setStatus("Open a level first"); return; }
             auto name = M::fileBase();
+            std::error_code ec;
+            bool existed = std::filesystem::exists(M::pathFor(name), ec);
             bool ok = M::save(name);
-            this->setStatus(ok ? fmt::format("Saved as '{}' ({} actions)", name, M::actions.size())
+            this->setStatus(ok ? fmt::format("{} '{}' ({} actions)", existed ? "Overwrote" : "Saved as", name, M::actions.size())
                                : std::string("Nothing to save (or folder not writable)"));
         });
         m_buttonMenu->addChildAtPosition(saveBtn, Anchor::Center, {-75.f, -30.f});
@@ -616,14 +661,14 @@ protected:
         M::setMode(m);
         refresh();
         if (m == Mode::Record) {
-            Notification::create("Recording armed - restart the level", NotificationIcon::Success, 2.f)->show();
+            Notification::create(fmt::format("Recording as '{}' - restart the level", M::fileBase()), NotificationIcon::Success, 2.f)->show();
         } else if (m == Mode::Play) {
             Notification::create("Macro ready - restart the level", NotificationIcon::Success, 2.f)->show();
         }
     }
 
     bool init() {
-        if (!Popup::init(340.f, 290.f)) return false;
+        if (!Popup::init(340.f, 300.f)) return false;
         this->setTitle("Percent Macro");
 
         // ---- mode buttons
@@ -700,14 +745,30 @@ protected:
         });
         m_mainLayer->addChildAtPosition(skipInput, Anchor::Center, {130.f, -18.f});
 
+        // ---- macro to play after the skipped attempts (turns "die at %" off)
+        auto nextLabel = CCLabelBMFont::create("Then play macro", "bigFont.fnt");
+        nextLabel->setScale(.4f);
+        nextLabel->setAnchorPoint({0.f, .5f});
+        m_mainLayer->addChildAtPosition(nextLabel, Anchor::Center, {-150.f, -54.f});
+
+        auto nextInput = TextInput::create(130.f, "macro name", "chatFont.fnt");
+        nextInput->setMaxCharCount(24);
+        nextInput->setFilter("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_- ");
+        nextInput->setString(M::nextName, false);
+        nextInput->setCallback([](std::string const& s) {
+            M::nextName = s;
+            Mod::get()->setSavedValue("next-macro", s);
+        });
+        m_mainLayer->addChildAtPosition(nextInput, Anchor::Center, {85.f, -54.f});
+
         // ---- button opacity (0 = invisible, it is still clickable at the bottom right)
         auto opLabel = CCLabelBMFont::create("Button opacity", "bigFont.fnt");
         opLabel->setScale(.4f);
-        m_mainLayer->addChildAtPosition(opLabel, Anchor::Center, {0.f, -55.f});
+        m_mainLayer->addChildAtPosition(opLabel, Anchor::Center, {0.f, -82.f});
 
         auto slider = Slider::create(this, menu_selector(MacroPopup::onOpacity), .7f);
         slider->setValue(M::opacity());
-        m_mainLayer->addChildAtPosition(slider, Anchor::Center, {0.f, -80.f});
+        m_mainLayer->addChildAtPosition(slider, Anchor::Center, {0.f, -104.f});
 
         // ---- clear + files + info
         auto clearSpr = ButtonSprite::create("Clear macro", 110, true, "bigFont.fnt", "GJ_button_06.png", 28.f, .5f);
@@ -715,17 +776,17 @@ protected:
             M::clearMacro();
             this->refresh();
         });
-        m_buttonMenu->addChildAtPosition(clearBtn, Anchor::Center, {-115.f, -118.f});
+        m_buttonMenu->addChildAtPosition(clearBtn, Anchor::Center, {-115.f, -128.f});
 
         auto filesSpr = ButtonSprite::create("Files", 80, true, "bigFont.fnt", "GJ_button_02.png", 28.f, .5f);
         auto filesBtn = CCMenuItemExt::createSpriteExtra(filesSpr, [](CCObject*) {
             if (auto p = FolderPopup::create()) p->show();
         });
-        m_buttonMenu->addChildAtPosition(filesBtn, Anchor::Center, {-30.f, -118.f});
+        m_buttonMenu->addChildAtPosition(filesBtn, Anchor::Center, {-30.f, -128.f});
 
         m_infoLabel = CCLabelBMFont::create("", "chatFont.fnt");
         m_infoLabel->setScale(.8f);
-        m_mainLayer->addChildAtPosition(m_infoLabel, Anchor::Center, {90.f, -118.f});
+        m_mainLayer->addChildAtPosition(m_infoLabel, Anchor::Center, {90.f, -128.f});
 
         refresh();
         return true;
@@ -786,4 +847,5 @@ $on_mod(Loaded) {
     M::skipN = Mod::get()->getSavedValue<int>("skip-n", 2);
     M::useFolder = Mod::get()->getSavedValue<bool>("use-folder", false);
     M::folder = Mod::get()->getSavedValue<std::string>("folder", std::string());
+    M::nextName = Mod::get()->getSavedValue<std::string>("next-macro", std::string());
 }
