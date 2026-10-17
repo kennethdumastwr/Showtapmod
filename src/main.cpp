@@ -64,6 +64,12 @@ namespace M {
         return (float)Mod::get()->getSettingValue<double>("button-opacity");
     }
 
+    // all pop-up notifications follow the "show-status" setting (off = silent, good for showcasing)
+    inline void notify(std::string const& text, NotificationIcon icon = NotificationIcon::Success) {
+        if (!Mod::get()->getSettingValue<bool>("show-status")) return;
+        Notification::create(text, icon, 2.f)->show();
+    }
+
     inline std::string keyFor(GJGameLevel* lvl) {
         int id = lvl->m_levelID.value();
         if (id > 0) return std::to_string(id);
@@ -233,7 +239,7 @@ namespace M {
         }
         save();
         mode = Mode::Off;
-        Notification::create("Recording finished - saved", NotificationIcon::Success, 2.f)->show();
+        M::notify("Recording finished - saved", NotificationIcon::Success);
     }
 
     // After the skipped attempts: switch to the "then play macro" and turn "die at %" off
@@ -242,14 +248,14 @@ namespace M {
         if (n.empty()) return;
         if (fileBase() != n || actions.empty()) {
             if (!loadFile(n)) {
-                Notification::create(fmt::format("Next macro '{}' not found", n), NotificationIcon::Error, 2.f)->show();
+                M::notify(fmt::format("Next macro '{}' not found", n), NotificationIcon::Error);
                 return;
             }
         }
         if (dieEnabled) {
             dieEnabled = false;
             Mod::get()->setSavedValue("die-enabled", false);
-            Notification::create("Die at % turned off for the next macro", NotificationIcon::Success, 2.f)->show();
+            M::notify("Die at % turned off for the next macro", NotificationIcon::Success);
         }
     }
 
@@ -661,9 +667,9 @@ protected:
         M::setMode(m);
         refresh();
         if (m == Mode::Record) {
-            Notification::create(fmt::format("Recording as '{}' - restart the level", M::fileBase()), NotificationIcon::Success, 2.f)->show();
+            M::notify(fmt::format("Recording as '{}' - restart the level", M::fileBase()), NotificationIcon::Success);
         } else if (m == Mode::Play) {
-            Notification::create("Macro ready - restart the level", NotificationIcon::Success, 2.f)->show();
+            M::notify("Macro ready - restart the level", NotificationIcon::Success);
         }
     }
 
