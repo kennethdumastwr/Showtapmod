@@ -169,6 +169,8 @@ inline void onCommands(GJBaseGameLayer* self, bool isHalfTick) {
 // MacroPL::levelComplete: returns true when the completion belongs to a simulated run (swallow it)
 inline bool onLevelComplete() {
     if (!R.inSim) return false;
+    // Ignore accidental level completions on the first 10 ticks (prevents lingering end-screen state bugs)
+    if (R.fullCalls < 10) return true;
     R.completed = true;
     if (R.mode == Run::Test) finishRun(true); else R.done = true;
     return true;
@@ -765,7 +767,7 @@ class $modify(FWPlayLayer, PlayLayer) {
     void resetLevel() {
         PlayLayer::resetLevel();
         
-        // Trigger the armed analysis on the fresh attempt reset (using FW:: namespace prefix)
+        // Trigger the armed analysis on the fresh attempt reset
         if (FW::pendingAnalysis) {
             FW::pendingAnalysis = false;
             if (auto pl = PlayLayer::get()) {
@@ -778,6 +780,7 @@ class $modify(FWPlayLayer, PlayLayer) {
 
     void destroyPlayer(PlayerObject* player, GameObject* obj) {
         if (FW::R.inSim) {                               // simulated death: record it, show nothing
+            if (FW::R.fullCalls < 10) return;            // Ignore accidental deaths on the first few ticks
             if (!FW::R.done) {
                 FW::R.died = true;
                 FW::R.deathTick = std::max(0, FW::R.fullCalls - 1);
