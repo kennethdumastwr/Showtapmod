@@ -25,6 +25,7 @@ inline int cpuMs = 40;          // milliseconds of every frame spent simulating
 inline int horizon = 1200;      // a shifted click that survives this many ticks past the change counts as passed (0 = to the end)
 inline bool reconverge = true;  // stop a test early once the player is back on the baseline path
 inline std::string lengthText;
+inline bool pendingAnalysis = false; // Arms the analysis for the next level reset/attempt
 
 inline void loadSettings() {
     auto m = Mod::get();
@@ -217,17 +218,14 @@ struct Analyzer {
     }
 
     // restore a snapshot and set up which actions are still to fire (optionally with one shifted)
-        void beginFrom(Snap const& s, int shiftIdx, double newTrig) {
+    void beginFrom(Snap const& s, int shiftIdx, double newTrig) {
         pl->loadFromCheckpoint(s.cp);
-        pl->m_isPaused = false;
-        pl->m_started = true; // <-- Ensure simulated runs start properly from checkpoints too
         R.fullCalls = s.tick;
         R.done = R.died = R.completed = R.success = false;
         R.match = 0;
         const size_t n = M::actions.size();
         for (size_t j = 0; j < n; ++j) R.trig[j] = M::actions[j].x;
         if (shiftIdx >= 0) R.trig[shiftIdx] = newTrig;
-        // ... rest of the function
 
         bool held[2] = {false, false};
         std::vector<size_t> pending;
@@ -245,7 +243,7 @@ struct Analyzer {
 
     void fail(std::string const& why) { msg = why; ph = Ph::Failed; }
 
-            void init() {
+    void init() {
         const size_t n = M::actions.size();
         ensureResults();
         if (results.size() != n) results.assign(n, Win{});
@@ -259,9 +257,7 @@ struct Analyzer {
         for (size_t j = 0; j < n; ++j) { R.trig[j] = M::actions[j].x; if (M::actions[j].p2) R.usesP2 = true; }
 
         pl->setVisible(false);
-        pl->m_isPaused = false;
         pl->resetLevelFromStart();
-        pl->m_started = true; // <-- Forces the level to start simulating physics immediately
         R.fullCalls = 0;
         root = takeSnap();
 
@@ -273,7 +269,6 @@ struct Analyzer {
         t0 = std::chrono::steady_clock::now();
         ph = Ph::Trace;
     }
-
 
     void endTrace() {
         baseTicks = R.fullCalls;
@@ -419,18 +414,9 @@ protected:
     bool m_finished = false;
     float m_labelTimer = 0.f;
 
-        bool init(PlayLayer* pl) {
+    bool init(PlayLayer* pl) {
         if (!CCLayer::init()) return false;
         m_pl = pl;
-
-        // 1. Remove the PauseLayer so the game stops being paused
-        if (auto pauseLayer = CCDirector::get()->getRunningScene()->getChildByType<PauseLayer>()) {
-            pauseLayer->removeFromParent();
-        }
-
-        // 2. Ensure PlayLayer is explicitly unpaused
-        pl->m_isPaused = false;
-
         R.active = true;                              // freeze the real game before anything else
         m_a = std::make_unique<Analyzer>(pl);
 
@@ -458,7 +444,6 @@ protected:
         this->scheduleUpdate();
         return true;
     }
-
 
     bool ccTouchBegan(CCTouch* touch, CCEvent*) override {
         if (m_stopBtn && m_stopBtn->boundingBox().containsPoint(this->convertToNodeSpace(touch->getLocation()))) {
@@ -643,7 +628,11 @@ protected:
         if (M::actions.empty()) return err("Load a macro first.");
         if (M::mode == Mode::Record) return err("Turn recording off first (Macro popup > Off).");
         if (R.active) return;
-        if (auto ov = FWOverlay::create(pl)) CCScene::get()->addChild(ov, 5000);
+
+        // Arm analysis for the next attempt/restart
+        pendingAnalysis = true;
+        Notification::create("Analysis armed! Restart the level to begin.", NotificationIcon::Success, 2.5f)->show();
+        this->onClose(nullptr);
     }
 
     void onDelete() {
@@ -772,6 +761,21 @@ class $modify(FWPlayLayer, PlayLayer) {
         if (FW::R.active && !FW::R.inSim) return;            // analyzer owns the level: freeze the real loop
         PlayLayer::update(dt);
     }
+
+    void resetLevel() {
+        PlayLayer::resetLevel();
+        
+        // Trigger the armed analysis on the fresh attempt reset
+        if (FW::pendingAnalysis) {
+            FW::pendingAnalysis = false;
+            if (auto pl = PlayLayer::get()) {
+                if (auto ov = FWOverlay::create(pl)) {
+                    CCScene::get()->addChild(ov, 5000);
+                }
+            }
+        }
+    }
+
     void destroyPlayer(PlayerObject* player, GameObject* obj) {
         if (FW::R.inSim) {                               // simulated death: record it, show nothing
             if (!FW::R.done) {
