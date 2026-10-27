@@ -308,6 +308,8 @@ static void inject(GJBaseGameLayer* l, bool down, bool p2) {
     M::injecting = false;
 }
 
+#include "framewin.hpp"   // Frame Windows: analysis, HUD and popup (needs M:: and inject() above)
+
 // ---------------------------------------------------------------- recording / playback
 class $modify(MacroGJ, GJBaseGameLayer) {
     void handleButton(bool down, int button, bool isPlayer1) {
@@ -330,6 +332,11 @@ class $modify(MacroGJ, GJBaseGameLayer) {
     }
 
     void processCommands(float dt, bool isHalfTick, bool isLastTick) {
+        if (FW::R.active) {   // Frame Windows analysis: its own click injection replaces the macro player
+            FW::onCommands(this, isHalfTick);
+            GJBaseGameLayer::processCommands(dt, isHalfTick, isLastTick);
+            return;
+        }
         auto pl = PlayLayer::get();
         auto self = static_cast<GJBaseGameLayer*>(this);
         bool playing = M::ready && pl && static_cast<GJBaseGameLayer*>(pl) == self
@@ -355,6 +362,7 @@ class $modify(MacroGJ, GJBaseGameLayer) {
                 while (M::idx < M::actions.size() && x >= M::actions[M::idx].x - M::EPS) {
                     auto a = M::actions[M::idx];
                     inject(self, a.down, a.p2);
+                    FW::onFire(M::idx);
                     M::idx++;
                 }
             }
@@ -402,6 +410,7 @@ class $modify(MacroPL, PlayLayer) {
         label->setAnchorPoint({0.f, 1.f});
         label->setPosition({6.f, win.height - 6.f});
         m_uiLayer->addChild(label, 50);
+        FW::attachHUD(this);
         return true;
     }
 
@@ -412,6 +421,7 @@ class $modify(MacroPL, PlayLayer) {
 
     void postUpdate(float dt) {
         PlayLayer::postUpdate(dt);
+        FW::updateHUD(this, dt);
 
         // reached 100% while recording -> stop recording automatically
         if (M::ready && M::mode == Mode::Record && m_player1 && !m_player1->m_isDead
@@ -444,6 +454,7 @@ class $modify(MacroPL, PlayLayer) {
     }
 
     void levelComplete() {
+        if (FW::onLevelComplete()) return;
         M::finishRecording(this);
         PlayLayer::levelComplete();
     }
@@ -842,6 +853,7 @@ class $modify(MacroPause, PauseLayer) {
         menu->setID("macro-menu"_spr);
         menu->setPosition({win.width - 48.f, 24.f});
         menu->addChild(btn);
+        menu->addChild(FW::makePauseButton());   // "Windows" button, just above "Macro"
         this->addChild(menu, 100);
     }
 };
@@ -854,4 +866,5 @@ $on_mod(Loaded) {
     M::useFolder = Mod::get()->getSavedValue<bool>("use-folder", false);
     M::folder = Mod::get()->getSavedValue<std::string>("folder", std::string());
     M::nextName = Mod::get()->getSavedValue<std::string>("next-macro", std::string());
+    FW::loadSettings();
 }
