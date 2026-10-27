@@ -765,11 +765,11 @@ class $modify(FWPlayLayer, PlayLayer) {
     void resetLevel() {
         PlayLayer::resetLevel();
         
-        // Trigger the armed analysis on the fresh attempt reset
+        // Trigger the armed analysis on the fresh attempt reset (using FW:: namespace prefix)
         if (FW::pendingAnalysis) {
             FW::pendingAnalysis = false;
             if (auto pl = PlayLayer::get()) {
-                if (auto ov = FWOverlay::create(pl)) {
+                if (auto ov = FW::FWOverlay::create(pl)) {
                     CCScene::get()->addChild(ov, 5000);
                 }
             }
