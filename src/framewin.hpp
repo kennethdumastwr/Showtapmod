@@ -217,14 +217,17 @@ struct Analyzer {
     }
 
     // restore a snapshot and set up which actions are still to fire (optionally with one shifted)
-    void beginFrom(Snap const& s, int shiftIdx, double newTrig) {
+        void beginFrom(Snap const& s, int shiftIdx, double newTrig) {
         pl->loadFromCheckpoint(s.cp);
+        pl->m_isPaused = false;
+        pl->m_hasStarted = true; // <-- Ensure simulated runs start properly from checkpoints too
         R.fullCalls = s.tick;
         R.done = R.died = R.completed = R.success = false;
         R.match = 0;
         const size_t n = M::actions.size();
         for (size_t j = 0; j < n; ++j) R.trig[j] = M::actions[j].x;
         if (shiftIdx >= 0) R.trig[shiftIdx] = newTrig;
+        // ... rest of the function
 
         bool held[2] = {false, false};
         std::vector<size_t> pending;
@@ -242,7 +245,7 @@ struct Analyzer {
 
     void fail(std::string const& why) { msg = why; ph = Ph::Failed; }
 
-        void init() {
+            void init() {
         const size_t n = M::actions.size();
         ensureResults();
         if (results.size() != n) results.assign(n, Win{});
@@ -256,8 +259,9 @@ struct Analyzer {
         for (size_t j = 0; j < n; ++j) { R.trig[j] = M::actions[j].x; if (M::actions[j].p2) R.usesP2 = true; }
 
         pl->setVisible(false);
-        pl->m_isPaused = false; // Ensure it's unpaused for the offscreen trace
+        pl->m_isPaused = false;
         pl->resetLevelFromStart();
+        pl->m_hasStarted = true; // <-- Forces the level to start simulating physics immediately
         R.fullCalls = 0;
         root = takeSnap();
 
