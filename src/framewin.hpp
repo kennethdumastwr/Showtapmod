@@ -220,7 +220,7 @@ struct Analyzer {
         void beginFrom(Snap const& s, int shiftIdx, double newTrig) {
         pl->loadFromCheckpoint(s.cp);
         pl->m_isPaused = false;
-        pl->m_hasStarted = true; // <-- Ensure simulated runs start properly from checkpoints too
+        pl->m_started = true; // <-- Ensure simulated runs start properly from checkpoints too
         R.fullCalls = s.tick;
         R.done = R.died = R.completed = R.success = false;
         R.match = 0;
@@ -261,7 +261,7 @@ struct Analyzer {
         pl->setVisible(false);
         pl->m_isPaused = false;
         pl->resetLevelFromStart();
-        pl->m_hasStarted = true; // <-- Forces the level to start simulating physics immediately
+        pl->m_started = true; // <-- Forces the level to start simulating physics immediately
         R.fullCalls = 0;
         root = takeSnap();
 
