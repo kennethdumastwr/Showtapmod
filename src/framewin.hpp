@@ -242,7 +242,7 @@ struct Analyzer {
 
     void fail(std::string const& why) { msg = why; ph = Ph::Failed; }
 
-    void init() {
+        void init() {
         const size_t n = M::actions.size();
         ensureResults();
         if (results.size() != n) results.assign(n, Win{});
@@ -256,6 +256,7 @@ struct Analyzer {
         for (size_t j = 0; j < n; ++j) { R.trig[j] = M::actions[j].x; if (M::actions[j].p2) R.usesP2 = true; }
 
         pl->setVisible(false);
+        pl->m_isPaused = false; // Ensure it's unpaused for the offscreen trace
         pl->resetLevelFromStart();
         R.fullCalls = 0;
         root = takeSnap();
@@ -268,6 +269,7 @@ struct Analyzer {
         t0 = std::chrono::steady_clock::now();
         ph = Ph::Trace;
     }
+
 
     void endTrace() {
         baseTicks = R.fullCalls;
@@ -413,9 +415,18 @@ protected:
     bool m_finished = false;
     float m_labelTimer = 0.f;
 
-    bool init(PlayLayer* pl) {
+        bool init(PlayLayer* pl) {
         if (!CCLayer::init()) return false;
         m_pl = pl;
+
+        // 1. Remove the PauseLayer so the game stops being paused
+        if (auto pauseLayer = CCDirector::get()->getRunningScene()->getChildByType<PauseLayer>()) {
+            pauseLayer->removeFromParent();
+        }
+
+        // 2. Ensure PlayLayer is explicitly unpaused
+        pl->m_isPaused = false;
+
         R.active = true;                              // freeze the real game before anything else
         m_a = std::make_unique<Analyzer>(pl);
 
@@ -443,6 +454,7 @@ protected:
         this->scheduleUpdate();
         return true;
     }
+
 
     bool ccTouchBegan(CCTouch* touch, CCEvent*) override {
         if (m_stopBtn && m_stopBtn->boundingBox().containsPoint(this->convertToNodeSpace(touch->getLocation()))) {
