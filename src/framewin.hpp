@@ -25,6 +25,7 @@ inline int cpuMs = 40;          // milliseconds of every frame spent simulating
 inline int horizon = 1200;      // a shifted click that survives this many ticks past the change counts as passed (0 = to the end)
 inline bool reconverge = true;  // stop a test early once the player is back on the baseline path
 inline std::string lengthText;
+inline bool showWide = true;           // HUD: extra dim line counting clicks whose window is wider than 10
 inline bool pendingAnalysis = false;   // armed from the popup; the analysis starts on the next level reset
 
 inline void loadSettings() {
@@ -34,6 +35,7 @@ inline void loadSettings() {
     horizon = std::max(0, m->getSavedValue<int>("fw-horizon", 1200));
     reconverge = m->getSavedValue<bool>("fw-reconverge", true);
     lengthText = m->getSavedValue<std::string>("fw-length", std::string());
+    showWide = m->getSavedValue<bool>("fw-show-wide", true);
 }
 
 // ------------------------------------------------------------------ results for the loaded macro
@@ -43,6 +45,7 @@ inline std::string resultsName;
 inline bool resultsOk = false;        // a results file exists for this exact macro
 inline bool resultsComplete = false;  // every click analysed
 inline long long resultsTicks = 0;
+inline uint64_t resultsSig = 0;       // signature of the baseline run these results belong to
 
 inline uint64_t macroHash() {
     uint64_t h = fwcore::kHashSeed;
@@ -69,7 +72,7 @@ inline void ensureResults(bool force = false) {
     const std::string name = M::fileBase();
     if (!force && fp == resultsFp && name == resultsName) return;
     resultsFp = fp; resultsName = name;
-    resultsOk = false; resultsComplete = false; resultsTicks = 0;
+    resultsOk = false; resultsComplete = false; resultsTicks = 0; resultsSig = 0;
     results.assign(M::actions.size(), Win{});
     if (M::actions.empty()) return;
 
@@ -79,16 +82,17 @@ inline void ensureResults(bool force = false) {
     fwcore::FileData d;
     if (!fwcore::parse(ss.str(), d)) return;
     if (d.hash != macroHash() || d.wins.size() != M::actions.size()) return;   // macro changed since
-    results = d.wins; resultsComplete = d.complete; resultsTicks = d.ticks; resultsOk = true;
+    if (!d.hasSig) return;   // written by an older version (could be a broken run saved as 'complete'): not trusted
+    results = d.wins; resultsComplete = d.complete; resultsTicks = d.ticks; resultsSig = d.sig; resultsOk = true;
 }
 
-inline bool saveResults(bool complete, long long ticks) {
+inline bool saveResults(bool complete, long long ticks, uint64_t sig) {
     fwcore::FileData d;
-    d.macro = M::fileBase(); d.hash = macroHash(); d.complete = complete; d.ticks = ticks; d.wins = results;
+    d.macro = M::fileBase(); d.hash = macroHash(); d.complete = complete; d.ticks = ticks; d.sig = sig; d.wins = results;
     std::ofstream out(resultsPath(), std::ios::binary);
     if (!out) return false;
     out << fwcore::serialize(d);
-    resultsOk = true; resultsComplete = complete; resultsTicks = ticks;
+    resultsOk = true; resultsComplete = complete; resultsTicks = ticks; resultsSig = sig;
     return true;
 }
 
@@ -114,9 +118,13 @@ struct Run {
     int horizon = 0;
     bool reconv = true, usesP2 = false;
     int killerId = 0;             // object that killed the player in the last simulated death
+    double killerX = 0, killerY = 0, playerY = 0;
     long long ignoredCompletes = 0;   // level-complete calls ignored because the player was nowhere near the end
     bool tickOnAll = false;       // some builds only ever report half ticks: then every processCommands call is a tick
     long long updates = 0;        // update steps we have issued
+    bool strict = false;          // k=0 test: the first ticks after a restore must match the baseline exactly
+    int strictUntil = 0;
+    bool k0Mismatch = false;
 };
 inline Run R;
 
@@ -131,10 +139,11 @@ inline TS sample(PlayLayer* pl) {
     }
     return s;
 }
-inline bool sameState(TS const& a, TS const& b) {
-    return a.flags == b.flags && std::fabs(a.y - b.y) < 1e-4f && std::fabs(a.vy - b.vy) < 1e-4f
-        && std::fabs(a.y2 - b.y2) < 1e-4f && std::fabs(a.vy2 - b.vy2) < 1e-4f;
+inline bool sameStateTol(TS const& a, TS const& b, float tol) {
+    return a.flags == b.flags && std::fabs(a.y - b.y) < tol && std::fabs(a.vy - b.vy) < tol
+        && std::fabs(a.y2 - b.y2) < tol && std::fabs(a.vy2 - b.vy2) < tol;
 }
+inline bool sameState(TS const& a, TS const& b) { return sameStateTol(a, b, 1e-4f); }
 
 inline void finishRun(bool ok) { R.success = ok; R.done = true; }
 
@@ -154,6 +163,9 @@ inline void onCommands(GJBaseGameLayer* self, bool isHalfTick) {
             R.P.push_back(x);
             R.base.push_back(sample(pl));
         } else if (R.mode == Run::Test) {
+            if (R.strict && tick < R.strictUntil && tick < (int)R.base.size() && !sameStateTol(sample(pl), R.base[tick], 2e-3f)) {
+                R.k0Mismatch = true; finishRun(false); return;      // the restore did not reproduce the baseline
+            }
             if (tick >= R.successTick) { finishRun(true); return; }
             if (R.horizon > 0 && tick >= R.lastChange + R.horizon) { finishRun(true); return; }
             if (R.reconv && tick > R.lastChange && tick < (int)R.base.size()) {
@@ -189,6 +201,8 @@ inline void onDeath(GameObject* obj) {
     R.died = true;
     R.deathTick = std::max(0, R.fullCalls - 1);
     R.killerId = obj ? obj->m_objectID : 0;
+    if (obj) { R.killerX = obj->getPositionX(); R.killerY = obj->getPositionY(); }
+    if (auto pl = PlayLayer::get()) if (pl->m_player1) R.playerY = pl->m_player1->getPositionY();
     R.done = true;                                   // success stays false
 }
 
@@ -221,10 +235,21 @@ struct Analyzer {
     int lastRow = -1, lastWindow = 0;
     long long pUpdates = 0, pCalls = 0, pHalf = 0, traceStartUpdates = 0;
     int pFull = 0;
+    uint64_t sig = 0;                    // signature of this baseline run (ticks + when every click fired)
+    std::vector<char> noop;              // actions that change nothing (release of a button that isn't held)
+    bool rootOnly = false, notedFallback = false;
+    long long restoreFallbacks = 0;
     std::vector<std::string> attempts;   // how each baseline attempt ended (for the failure message)
     int retries = 0;
 
-    explicit Analyzer(PlayLayer* p) : pl(p) {}
+    Ref<CheckpointObject> fresh;   // the game's own just-reset state, taken at the end of the player's restart
+    explicit Analyzer(PlayLayer* p, CheckpointObject* f = nullptr) : pl(p), fresh(f) {}
+
+    // put the level at its start: the snapshot of the game's own reset if we have one, else reset it ourselves
+    void toStart() {
+        if (fresh) pl->loadFromCheckpoint(fresh);
+        else pl->resetLevelFromStart();
+    }
 
     Snap takeSnap() {
         Snap s;
@@ -270,6 +295,8 @@ struct Analyzer {
         const size_t n = M::actions.size();
         ensureResults();
         if (results.size() != n) results.assign(n, Win{});
+        if (resultsComplete) results.assign(n, Win{});    // Analyze on a finished analysis starts it over
+        else for (auto& w : results) if (w.status == 3 || w.status == 4 || w.status == 5) w = Win{};   // retry anything that wasn't a real result
 
         sCycle = M::cycle; sActive = M::active; sSawSkip = M::sawSkip; sFailed = M::failed; sSkipEnabled = M::skipEnabled;
         M::skipEnabled = false; M::sawSkip = false;   // our resets must not count as attempts or swap the macro
@@ -281,7 +308,7 @@ struct Analyzer {
 
         // Probe first, with the level still visible: does the game actually run physics ticks when we step it,
         // and does it report them as full ticks or only half ticks?
-        pl->resetLevelFromStart();
+        toStart();
         R.fullCalls = 0;
         R.mode = Run::Advance;           // nothing to inject, nothing recorded
         t0 = std::chrono::steady_clock::now();
@@ -309,7 +336,7 @@ struct Analyzer {
         std::fill(R.fire.begin(), R.fire.end(), -1);
         for (size_t j = 0; j < M::actions.size(); ++j) R.trig[j] = M::actions[j].x;
 
-        pl->resetLevelFromStart();
+        toStart();
         pl->setVisible(false);           // from here on you only see the progress screen
         R.fullCalls = 0;
         root = takeSnap();
@@ -332,7 +359,8 @@ struct Analyzer {
         const float pct = pl->getCurrentPercent();
         const double endX = R.P.empty() ? 0.0 : R.P.back();
 
-        std::string how = R.completed ? "completed the level" : (R.died ? fmt::format("died (object {})", R.killerId) : "never ended");
+        std::string how = R.completed ? "completed the level"
+            : (R.died ? fmt::format("died to object {} at ({:.0f}, {:.0f}) with the player at y={:.0f}", R.killerId, R.killerX, R.killerY, R.playerY) : "never ended");
         attempts.push_back(fmt::format("attempt {}: {} at tick {} (x={:.1f}, {:.1f}%), {} of {} clicks fired, {} bogus level-complete calls ignored",
                                        attempts.size() + 1, how, R.fullCalls, endX, pct, fired, n, R.ignoredCompletes));
 
@@ -351,6 +379,27 @@ struct Analyzer {
         if (fired == 0) {
             fail("None of the macro's clicks fired in the baseline run, so nothing can be analysed.\n" + joinAttempts());
             return;
+        }
+
+        // Signature of this baseline. Saved results only count if they were computed against the same one.
+        sig = fwcore::kHashSeed;
+        sig = fwcore::hashRow(sig, (double)R.fullCalls, R.completed, false);
+        for (size_t j = 0; j < n; ++j) sig = fwcore::hashRow(sig, (double)R.fire[j], false, false);
+        if (resultsOk && resultsSig != 0 && resultsSig != sig) {
+            results.assign(n, Win{});
+            note += "Old results were computed against a different baseline run and were discarded.\n";
+        }
+
+        // A release of a button that isn't held (the usual first row of a macro) does nothing: not a click.
+        noop.assign(n, 0);
+        {
+            bool held[2] = {false, false};
+            for (size_t idx : R.order) {
+                if (R.fire[idx] < 0) continue;
+                bool& h = held[M::actions[idx].p2 ? 1 : 0];
+                if (!M::actions[idx].down && !h) noop[idx] = 1;
+                h = M::actions[idx].down;
+            }
         }
 
         R.successTick = R.completed ? INT_MAX : R.deathTick;
@@ -376,7 +425,9 @@ struct Analyzer {
         while (i < n && results[i].status != 0) ++i;                 // resume: skip what is already done
         if (i >= n) { finalize(); return; }
         if (R.fire[i] < 0) { results[i].status = 4; ++i; return; }   // never fires in the baseline run
+        if (noop[i]) { results[i] = Win{}; results[i].status = 5; ++i; return; }   // does nothing: not a click
         const int need = std::max(0, R.fire[i] - 12);
+        if (rootOnly) { cur = root; ws = fwcore::WindowSearch{}; ph = Ph::Search; return; }
         if (cur.tick + 30 < need) {                                  // move the baseline closer to this click
             beginFrom(cur, -1, 0.0);
             R.mode = Run::Advance;
@@ -394,6 +445,9 @@ struct Analyzer {
         R.mode = Run::Test;
         R.lastChange = R.fire[i] + std::max(k, 0);
         R.match = 0;
+        R.strict = (k == 0 && !rootOnly && cur.tick > 0);     // verify the snapshot restore itself on the unshifted test
+        R.strictUntil = cur.tick + 4;
+        R.k0Mismatch = false;
         curK = k;
         ph = Ph::Test;
     }
@@ -410,6 +464,14 @@ struct Analyzer {
 
     void testDone() {
         ++tests;
+        if (curK == 0 && !R.success && !rootOnly && cur.tick > 0) {
+            // The unshifted click failed from a snapshot, so restoring snapshots doesn't reproduce the baseline here.
+            // Fall back to starting every test from tick 0: slower, but exact.
+            rootOnly = true; ++restoreFallbacks;
+            if (!notedFallback) { notedFallback = true; note += "Checkpoint restores did not reproduce the baseline, so every test starts from tick 0 (slower but exact).\n"; }
+            cur = root; ws = fwcore::WindowSearch{}; ph = Ph::Search;
+            return;
+        }
         ws.report(curK, R.success);
         ph = Ph::Search;
     }
@@ -418,13 +480,18 @@ struct Analyzer {
         results[i] = ws.result();
         lastRow = (int)i; lastWindow = results[i].status == 1 ? results[i].window : (results[i].status == 2 ? 11 : 0);
         ++i; ++doneThisRun;
-        if (doneThisRun % 20 == 0) saveResults(false, baseTicks);
+        if (doneThisRun % 20 == 0) saveResults(false, baseTicks, sig);
         ph = Ph::NextClick;
     }
 
     void finalize() {
         complete = true;
-        for (auto& w : results) if (w.status == 0) complete = false;
+        size_t real = 0;
+        for (auto& w : results) { if (w.status == 0) complete = false; if (w.status == 1 || w.status == 2) ++real; }
+        if (real == 0) {   // nothing was actually measured: never present this as a finished analysis
+            complete = false;
+            note += "No click could be analysed (see the counts), so this is NOT saved as complete.\n";
+        }
         ph = Ph::Done;
     }
 
@@ -508,11 +575,11 @@ protected:
     bool m_finished = false;
     float m_labelTimer = 0.f;
 
-    bool init(PlayLayer* pl) {
+    bool init(PlayLayer* pl, CheckpointObject* fresh) {
         if (!CCLayer::init()) return false;
         m_pl = pl;
         R.active = true;                              // freeze the real game before anything else
-        m_a = std::make_unique<Analyzer>(pl);
+        m_a = std::make_unique<Analyzer>(pl, fresh);
 
         this->setTouchEnabled(true);
         this->setTouchPriority(-1000);                // swallow every touch: the popup/pause menu below must not react
@@ -575,19 +642,19 @@ protected:
         if (failed) {
             text = m_a->msg;
         } else {
-            saveResults(m_a->complete, m_a->baseTicks);
-            size_t ok = 0, wide = 0, unstable = 0, never = 0;
+            saveResults(m_a->complete, m_a->baseTicks, m_a->sig);
+            size_t ok = 0, wide = 0, unstable = 0, never = 0, noeffect = 0;
             for (auto& w : results) {
-                if (w.status == 1) ++ok; else if (w.status == 2) ++wide; else if (w.status == 3) ++unstable; else if (w.status == 4) ++never;
+                if (w.status == 1) ++ok; else if (w.status == 2) ++wide; else if (w.status == 3) ++unstable; else if (w.status == 4) ++never; else if (w.status == 5) ++noeffect;
             }
             const double secs = (double)m_a->baseTicks / fwcore::kTps;
             text = fmt::format("{}\nRun length measured: {} ticks = {:.2f} s ({:.6f}% per frame at constant speed)\n"
-                               "Windows 1-10 frames: {}   wider than 10: {}   unstable: {}   never fired: {}\n"
+                               "Windows 1-10 frames: {}   wider than 10: {}   unstable: {}   never fired: {}   no effect (not clicks): {}\n"
                                "Tests run: {}   half-tick calls: {}   probe: {} steps / {} calls / {} half{}\n{}\nSaved: {}",
                                m_a->complete ? "Done. Turn on \"Show windows\" in the Windows popup, then play the macro."
                                              : "Stopped early. Progress is saved; press Resume to continue.",
                                m_a->baseTicks, secs, secs > 0 ? 100.0 / (double)m_a->baseTicks : 0.0,
-                               ok, wide, unstable, never, m_a->tests, R.halfCalls, m_a->pUpdates, m_a->pCalls, m_a->pHalf, R.tickOnAll ? " (every call counted as a tick)" : "", m_a->note, resultsPath().string());
+                               ok, wide, unstable, never, noeffect, m_a->tests, R.halfCalls, m_a->pUpdates, m_a->pCalls, m_a->pHalf, R.tickOnAll ? " (every call counted as a tick)" : "", m_a->note, resultsPath().string());
         }
         log::info("Frame windows result:\n{}", text);
         m_a->restore(true);
@@ -596,9 +663,9 @@ protected:
     }
 
 public:
-    static FWOverlay* create(PlayLayer* pl) {
+    static FWOverlay* create(PlayLayer* pl, CheckpointObject* fresh = nullptr) {
         auto ret = new FWOverlay();
-        if (ret->init(pl)) { ret->autorelease(); return ret; }
+        if (ret->init(pl, fresh)) { ret->autorelease(); return ret; }
         delete ret;
         return nullptr;
     }
@@ -644,9 +711,9 @@ inline void attachHUD(PlayLayer* pl) {
 
 // the macro player just fired action `idx`
 inline void onFire(size_t idx) {
-    if (!hudNode || idx >= results.size() || results[idx].status != 1) return;
+    if (!hudNode || idx >= results.size() || (results[idx].status != 1 && results[idx].status != 2)) return;
     const int c = M::actions[idx].down ? 0 : 1;
-    hudFlash[c][fwcore::bucketOf(results[idx].window)] = .8f;
+    hudFlash[c][fwcore::bucketOf(results[idx].status == 2 ? 11 : results[idx].window)] = .8f;
 }
 
 inline void updateHUD(PlayLayer*, float dt) {
@@ -661,8 +728,8 @@ inline void updateHUD(PlayLayer*, float dt) {
         hudIdx = M::idx; hudFp = fp;
         for (auto& row : hudCount) for (auto& v : row) v = 0;
         for (size_t j = 0; j < M::idx && j < results.size(); ++j) {
-            if (results[j].status != 1) continue;
-            hudCount[M::actions[j].down ? 0 : 1][fwcore::bucketOf(results[j].window)]++;
+            if (results[j].status != 1 && results[j].status != 2) continue;     // no-effect rows (initial release) never count
+            hudCount[M::actions[j].down ? 0 : 1][fwcore::bucketOf(results[j].status == 2 ? 11 : results[j].window)]++;
         }
     }
     for (int c = 0; c < 2; ++c) {
@@ -677,7 +744,8 @@ inline void updateHUD(PlayLayer*, float dt) {
             if (f > 0.f) f = std::max(0.f, f - dt);
             const float k = std::min(1.f, f / .8f);
             l->setScale(.27f * (1.f + .45f * k));
-            l->setColor(f > 0.f ? ccColor3B{255, 230, 80} : ccColor3B{255, 255, 255});
+            l->setVisible(b < fwcore::kBuckets - 1 || showWide);
+            l->setColor(f > 0.f ? ccColor3B{255, 230, 80} : (b == fwcore::kBuckets - 1 ? ccColor3B{150, 150, 150} : ccColor3B{255, 255, 255}));
         }
     }
 }
@@ -819,9 +887,14 @@ protected:
             Mod::get()->setSavedValue("fw-reconverge", on);
         });
 
+        addToggle("Show >10 line on screen", showWide, -128.f, [](bool on) {
+            showWide = on;
+            Mod::get()->setSavedValue("fw-show-wide", on);
+        });
+
         auto help = CCLabelBMFont::create("Analyze runs the level offscreen at full speed.", "chatFont.fnt");
         help->setScale(.6f);
-        m_mainLayer->addChildAtPosition(help, Anchor::Center, {0.f, -132.f});
+        m_mainLayer->addChildAtPosition(help, Anchor::Center, {0.f, -148.f});
 
         refresh();
         return true;
@@ -860,7 +933,8 @@ class $modify(FWPlayLayer, PlayLayer) {
         if (FW::pendingAnalysis && !FW::R.active) {
             FW::pendingAnalysis = false;
             if (auto pl = PlayLayer::get()) {
-                if (auto ov = FW::FWOverlay::create(pl)) CCScene::get()->addChild(ov, 5000);
+                auto fresh = pl->createCheckpoint();   // the game's own clean start state, before we touch anything
+                if (auto ov = FW::FWOverlay::create(pl, fresh)) CCScene::get()->addChild(ov, 5000);
             }
         }
     }
