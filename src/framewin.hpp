@@ -25,7 +25,7 @@ inline int cpuMs = 40;          // milliseconds of every frame spent simulating
 inline int horizon = 1200;      // a shifted click that survives this many ticks past the change counts as passed (0 = to the end)
 inline bool reconverge = true;  // stop a test early once the player is back on the baseline path
 inline std::string lengthText;
-inline bool pendingAnalysis = false; // Arms the analysis for the next level reset/attempt
+inline bool pendingAnalysis = false;   // armed from the popup; the analysis starts on the next level reset
 
 inline void loadSettings() {
     auto m = Mod::get();
@@ -113,6 +113,10 @@ struct Run {
     int deathTick = -1, lastChange = 0, successTick = INT_MAX, match = 0;
     int horizon = 0;
     bool reconv = true, usesP2 = false;
+    int killerId = 0;             // object that killed the player in the last simulated death
+    long long ignoredCompletes = 0;   // level-complete calls ignored because the player was nowhere near the end
+    bool tickOnAll = false;       // some builds only ever report half ticks: then every processCommands call is a tick
+    long long updates = 0;        // update steps we have issued
 };
 inline Run R;
 
@@ -139,12 +143,13 @@ inline void onCommands(GJBaseGameLayer* self, bool isHalfTick) {
     auto pl = PlayLayer::get();
     if (!R.inSim || R.done || !pl || static_cast<GJBaseGameLayer*>(pl) != self || !pl->m_player1) return;
     ++R.calls;
+    const bool isTick = !isHalfTick || R.tickOnAll;
     int tick;
-    if (!isHalfTick) tick = R.fullCalls++;
+    if (isTick) tick = R.fullCalls++;
     else { ++R.halfCalls; tick = std::max(0, R.fullCalls - 1); }
     const double x = pl->m_player1->getPositionX();
 
-    if (!isHalfTick) {
+    if (isTick) {
         if (R.mode == Run::Trace) {
             R.P.push_back(x);
             R.base.push_back(sample(pl));
@@ -166,14 +171,25 @@ inline void onCommands(GJBaseGameLayer* self, bool isHalfTick) {
     }
 }
 
-// MacroPL::levelComplete: returns true when the completion belongs to a simulated run (swallow it)
+// MacroPL::levelComplete: returns true when the completion belongs to a simulated run (swallow it).
+// A real completion happens at ~100%. A completion reported while the player is nowhere near the end is
+// stale state left over from the previous attempt: ignore it and keep running.
 inline bool onLevelComplete() {
     if (!R.inSim) return false;
-    // Ignore accidental level completions on the first 10 ticks (prevents lingering end-screen state bugs)
-    if (R.fullCalls < 10) return true;
+    auto pl = PlayLayer::get();
+    if (pl && pl->getCurrentPercent() < 90.f) { ++R.ignoredCompletes; return true; }
     R.completed = true;
     if (R.mode == Run::Test) finishRun(true); else R.done = true;
     return true;
+}
+
+// FWPlayLayer::destroyPlayer during a simulated run
+inline void onDeath(GameObject* obj) {
+    if (R.done) return;
+    R.died = true;
+    R.deathTick = std::max(0, R.fullCalls - 1);
+    R.killerId = obj ? obj->m_objectID : 0;
+    R.done = true;                                   // success stays false
 }
 
 // ------------------------------------------------------------------ analyzer
@@ -188,7 +204,7 @@ inline std::vector<size_t> sortedOrder(std::vector<size_t> v) {
 }
 
 struct Analyzer {
-    enum class Ph { Init, Trace, NextClick, Advance, Search, Test, Done, Failed };
+    enum class Ph { Init, Probe, Trace, NextClick, Advance, Search, Test, Done, Failed };
     Ph ph = Ph::Init;
     PlayLayer* pl = nullptr;
     Snap root, cur;
@@ -203,6 +219,10 @@ struct Analyzer {
     // macro-player bookkeeping that our level resets must not disturb
     int sCycle = 0; bool sActive = true, sSawSkip = false, sFailed = false, sSkipEnabled = false;
     int lastRow = -1, lastWindow = 0;
+    long long pUpdates = 0, pCalls = 0, pHalf = 0, traceStartUpdates = 0;
+    int pFull = 0;
+    std::vector<std::string> attempts;   // how each baseline attempt ended (for the failure message)
+    int retries = 0;
 
     explicit Analyzer(PlayLayer* p) : pl(p) {}
 
@@ -215,6 +235,7 @@ struct Analyzer {
 
     void stepOnce() {
         R.inSim = true;
+        ++R.updates;
         pl->update(kDt);
         R.inSim = false;
     }
@@ -258,33 +279,96 @@ struct Analyzer {
         R.trig.resize(n); R.fire.assign(n, -1);
         for (size_t j = 0; j < n; ++j) { R.trig[j] = M::actions[j].x; if (M::actions[j].p2) R.usesP2 = true; }
 
-        pl->setVisible(false);
+        // Probe first, with the level still visible: does the game actually run physics ticks when we step it,
+        // and does it report them as full ticks or only half ticks?
         pl->resetLevelFromStart();
+        R.fullCalls = 0;
+        R.mode = Run::Advance;           // nothing to inject, nothing recorded
+        t0 = std::chrono::steady_clock::now();
+        ph = Ph::Probe;
+    }
+
+    void endProbe() {
+        pUpdates = R.updates; pCalls = R.calls; pHalf = R.halfCalls; pFull = R.fullCalls;
+        if (pCalls == 0) {
+            fail(fmt::format("The game was stepped {} times but never processed a physics tick (processCommands was never called).\n"
+                             "Close the pause menu and don't use Practice-mode checkpoints, then try again. "
+                             "If it still happens, send me this message.", pUpdates));
+            return;
+        }
+        R.tickOnAll = (pFull == 0);      // only half ticks seen: count every call as a tick
+        startBaseline();
+    }
+
+    // (re)start the baseline run from a fresh level reset
+    void startBaseline() {
+        R.done = R.died = R.completed = R.success = false;
+        R.fullCalls = 0; R.calls = 0; R.halfCalls = 0;
+        R.killerId = 0; R.ignoredCompletes = 0;
+        R.P.clear(); R.base.clear();
+        std::fill(R.fire.begin(), R.fire.end(), -1);
+        for (size_t j = 0; j < M::actions.size(); ++j) R.trig[j] = M::actions[j].x;
+
+        pl->resetLevelFromStart();
+        pl->setVisible(false);           // from here on you only see the progress screen
         R.fullCalls = 0;
         root = takeSnap();
 
-        std::vector<size_t> all(n);
+        std::vector<size_t> all(M::actions.size());
         std::iota(all.begin(), all.end(), size_t(0));
         R.order = sortedOrder(std::move(all));
         R.cur = 0; R.mode = Run::Trace;
         releaseAll(pl);
+        traceStartUpdates = R.updates;
         t0 = std::chrono::steady_clock::now();
         ph = Ph::Trace;
     }
 
     void endTrace() {
         baseTicks = R.fullCalls;
-        if (!R.completed && !R.died) { fail("The macro run never ended (no death and no level complete)."); return; }
+        const size_t n = M::actions.size();
+        size_t fired = 0;
+        for (int f : R.fire) if (f >= 0) ++fired;
+        const float pct = pl->getCurrentPercent();
+        const double endX = R.P.empty() ? 0.0 : R.P.back();
+
+        std::string how = R.completed ? "completed the level" : (R.died ? fmt::format("died (object {})", R.killerId) : "never ended");
+        attempts.push_back(fmt::format("attempt {}: {} at tick {} (x={:.1f}, {:.1f}%), {} of {} clicks fired, {} bogus level-complete calls ignored",
+                                       attempts.size() + 1, how, R.fullCalls, endX, pct, fired, n, R.ignoredCompletes));
+
+        if (!R.completed && !R.died) { fail("The macro run never ended (no death and no level complete).\n" + joinAttempts()); return; }
+
+        // A macro that beats (or nearly beats) the level can't end within the first moments. That is leftover
+        // state from the previous attempt: reset again and retry before giving up.
+        const bool tooEarly = R.fullCalls < 60 && !(R.completed && pct >= 90.f);
+        if (tooEarly) {
+            if (retries < 3) { ++retries; startBaseline(); return; }
+            fail("The baseline run keeps ending within the first moments after a reset, so there is nothing to analyse.\n"
+                 "What ended it:\n" + joinAttempts() +
+                 "\nTry restarting the level once yourself and arming the analysis again. If it keeps happening, send me this message.");
+            return;
+        }
+        if (fired == 0) {
+            fail("None of the macro's clicks fired in the baseline run, so nothing can be analysed.\n" + joinAttempts());
+            return;
+        }
+
         R.successTick = R.completed ? INT_MAX : R.deathTick;
         if (!R.completed) {
-            note = fmt::format("Warning: this macro dies in the analyzer at tick {} (x={:.1f}). "
+            note = fmt::format("Warning: this macro dies in the analyzer at tick {} (x={:.1f}, {:.1f}%, object {}). "
                                "Clicks after that can't be analysed. If it beats the level when you play it, "
                                "the analyzer and the real game disagree (TPS or other mods?).",
-                               R.deathTick, R.P.empty() ? 0.0 : R.P.back());
+                               R.deathTick, endX, pct, R.killerId);
         }
         cur = root;
         i = 0;
         ph = Ph::NextClick;
+    }
+
+    std::string joinAttempts() const {
+        std::string out;
+        for (auto& a : attempts) out += a + "\n";
+        return out;
     }
 
     void nextClick() {
@@ -351,9 +435,16 @@ struct Analyzer {
             if (stopRequested) { complete = false; ph = Ph::Done; break; }
             switch (ph) {
                 case Ph::Init: init(); break;
+                case Ph::Probe:
+                    stepOnce();
+                    if (R.done || R.updates >= 90) endProbe();
+                    break;
                 case Ph::Trace:
                     stepOnce();
                     if (R.done) endTrace();
+                    else if (R.fullCalls == 0 && R.updates - traceStartUpdates > 600)
+                        fail("The probe saw physics ticks, but after hiding the level and restarting, the game stopped producing any. "
+                             "Send me this message.");
                     else if (R.fullCalls > 240 * 60 * 30) fail("The macro run is longer than 30 minutes of ticks; stopped.");
                     break;
                 case Ph::NextClick: nextClick(); break;
@@ -397,7 +488,8 @@ struct Analyzer {
             eta = left >= 90 ? fmt::format("{:.0f} min", left / 60.0) : fmt::format("{:.0f} s", left);
         }
         switch (ph) {
-            case Ph::Init: case Ph::Trace: return fmt::format("Recording the baseline run... tick {}", R.fullCalls);
+            case Ph::Init: case Ph::Probe: return fmt::format("Checking that the game runs...\nsteps {}  physics calls {}  half-tick calls {}", R.updates, R.calls, R.halfCalls);
+            case Ph::Trace: return fmt::format("Recording the baseline run...\ntick {}   steps {}   half-tick calls {}{}", R.fullCalls, R.updates, R.halfCalls, R.tickOnAll ? "   (counting every call)" : "");
             default: break;
         }
         return fmt::format("{} / {} clicks   tests {}   elapsed {:.0f} s   left ~{}{}", done, n, tests, el, eta,
@@ -491,11 +583,11 @@ protected:
             const double secs = (double)m_a->baseTicks / fwcore::kTps;
             text = fmt::format("{}\nRun length measured: {} ticks = {:.2f} s ({:.6f}% per frame at constant speed)\n"
                                "Windows 1-10 frames: {}   wider than 10: {}   unstable: {}   never fired: {}\n"
-                               "Tests run: {}   half-tick calls: {}\n{}\nSaved: {}",
+                               "Tests run: {}   half-tick calls: {}   probe: {} steps / {} calls / {} half{}\n{}\nSaved: {}",
                                m_a->complete ? "Done. Turn on \"Show windows\" in the Windows popup, then play the macro."
                                              : "Stopped early. Progress is saved; press Resume to continue.",
                                m_a->baseTicks, secs, secs > 0 ? 100.0 / (double)m_a->baseTicks : 0.0,
-                               ok, wide, unstable, never, m_a->tests, R.halfCalls, m_a->note, resultsPath().string());
+                               ok, wide, unstable, never, m_a->tests, R.halfCalls, m_a->pUpdates, m_a->pCalls, m_a->pHalf, R.tickOnAll ? " (every call counted as a tick)" : "", m_a->note, resultsPath().string());
         }
         log::info("Frame windows result:\n{}", text);
         m_a->restore(true);
@@ -630,9 +722,7 @@ protected:
         if (M::actions.empty()) return err("Load a macro first.");
         if (M::mode == Mode::Record) return err("Turn recording off first (Macro popup > Off).");
         if (R.active) return;
-
-        // Arm analysis for the next attempt/restart
-        pendingAnalysis = true;
+        pendingAnalysis = true;                // starts on the next level reset (restart or death)
         Notification::create("Analysis armed! Restart the level to begin.", NotificationIcon::Success, 2.5f)->show();
         this->onClose(nullptr);
     }
@@ -757,7 +847,8 @@ inline CCMenuItemSpriteExtra* makePauseButton() {
 
 } // namespace FW
 
-// Freezes the real game loop while the analyzer runs, and turns deaths inside simulated runs into a flag.
+// Freezes the real game loop while the analyzer runs, starts an armed analysis on the next level reset,
+// and turns deaths inside simulated runs into a flag.
 class $modify(FWPlayLayer, PlayLayer) {
     void update(float dt) {
         if (FW::R.active && !FW::R.inSim) return;            // analyzer owns the level: freeze the real loop
@@ -766,28 +857,16 @@ class $modify(FWPlayLayer, PlayLayer) {
 
     void resetLevel() {
         PlayLayer::resetLevel();
-        
-        // Trigger the armed analysis on the fresh attempt reset
-        if (FW::pendingAnalysis) {
+        if (FW::pendingAnalysis && !FW::R.active) {
             FW::pendingAnalysis = false;
             if (auto pl = PlayLayer::get()) {
-                if (auto ov = FW::FWOverlay::create(pl)) {
-                    CCScene::get()->addChild(ov, 5000);
-                }
+                if (auto ov = FW::FWOverlay::create(pl)) CCScene::get()->addChild(ov, 5000);
             }
         }
     }
 
     void destroyPlayer(PlayerObject* player, GameObject* obj) {
-        if (FW::R.inSim) {                               // simulated death: record it, show nothing
-            if (FW::R.fullCalls < 10) return;            // Ignore accidental deaths on the first few ticks
-            if (!FW::R.done) {
-                FW::R.died = true;
-                FW::R.deathTick = std::max(0, FW::R.fullCalls - 1);
-                FW::R.done = true;                       // success stays false
-            }
-            return;
-        }
+        if (FW::R.inSim) { FW::onDeath(obj); return; }       // simulated death: record it, show nothing
         PlayLayer::destroyPlayer(player, obj);
     }
 };
