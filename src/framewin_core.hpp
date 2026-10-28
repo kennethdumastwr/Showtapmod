@@ -16,16 +16,17 @@ constexpr double kTps = 240.0;
 struct Win {
     int8_t lo = 0, hi = 0;        // how many frames earlier / later it still works
     int8_t window = 0;            // 1..10 frames (11 = more than 10)
-    uint8_t status = 0;           // 0 not analysed, 1 ok, 2 wider than 10, 3 unstable, 4 never fired
+    uint8_t status = 0;           // 0 not analysed, 1 ok, 2 wider than 10, 3 unstable, 4 never fired, 5 no effect (release of a button that wasn't held)
 };
 
-// HUD buckets: 1, 2, 3, 4, 5-6, 7-8, 9, 10
-constexpr int kBuckets = 8;
+// HUD buckets: 1, 2, 3, 4, 5-6, 7-8, 9, 10, and a last one for 'wider than 10'
+constexpr int kBuckets = 9;
 inline const char* bucketName(int b) {
-    static const char* n[kBuckets] = {"1", "2", "3", "4", "5-6", "7-8", "9", "10"};
+    static const char* n[kBuckets] = {"1", "2", "3", "4", "5-6", "7-8", "9", "10", ">10"};
     return n[b];
 }
-inline int bucketOf(int w) {          // w in 1..10
+inline int bucketOf(int w) {          // w in 1..10, or 11 for 'wider than 10'
+    if (w > kMaxWin) return 8;
     if (w <= 4) return w - 1;
     if (w <= 6) return 4;
     if (w <= 8) return 5;
@@ -92,6 +93,8 @@ struct FileData {
     uint64_t hash = 0;
     bool complete = false;
     long long ticks = 0;
+    uint64_t sig = 0;             // signature of the baseline run the results were computed against
+    bool hasSig = false;          // files from older versions have none and are not trusted
     std::vector<Win> wins;
 };
 
@@ -99,7 +102,7 @@ inline std::string serialize(const FileData& d) {
     std::ostringstream o;
     o << "# frame-windows v1\n# macro " << d.macro << "\n";
     o << "# meta actions " << d.wins.size() << " hash " << d.hash << " complete " << (d.complete ? 1 : 0)
-      << " ticks " << d.ticks << "\n# idx status window lo hi\n";
+      << " ticks " << d.ticks << " sig " << d.sig << "\n# idx status window lo hi\n";
     for (size_t i = 0; i < d.wins.size(); ++i) {
         const auto& w = d.wins[i];
         o << i << ' ' << (int)w.status << ' ' << (int)w.window << ' ' << (int)w.lo << ' ' << (int)w.hi << '\n';
@@ -125,6 +128,7 @@ inline bool parse(const std::string& text, FileData& d) {
                     else if (k == "hash") m >> d.hash;
                     else if (k == "complete") { m >> c; d.complete = c != 0; }
                     else if (k == "ticks") m >> d.ticks;
+                    else if (k == "sig") { m >> d.sig; d.hasSig = true; }
                 }
                 gotMeta = true;
             }
