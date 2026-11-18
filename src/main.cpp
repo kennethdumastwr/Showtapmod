@@ -3,6 +3,7 @@
 #include <Geode/modify/GJBaseGameLayer.hpp>
 #include <Geode/modify/PlayLayer.hpp>
 #include <Geode/modify/PauseLayer.hpp>
+#include <Geode/modify/PlayerObject.hpp>
 #include <Geode/ui/TextInput.hpp>
 #include <fstream>
 #include <sstream>
@@ -12,7 +13,7 @@
 
 using namespace geode::prelude;
 
-enum class Mode { Off, Record, Play };
+enum class Mode { Off, Record, Play, Transfer };
 
 // x = exact player X position (this IS the level percent, just without rounding)
 // stored as double and saved with 25 decimals
@@ -32,6 +33,11 @@ struct MacroInfo {
 
 namespace M {
     inline Mode mode = Mode::Off;
+    // Record and Transfer (recording another macro bot) share the same recording code
+    inline bool recording() { return mode == Mode::Record || mode == Mode::Transfer; }
+    inline int btnDepth = 0;      // >0 while GJBaseGameLayer::handleButton is running
+    inline bool inReset = false;  // true while the level is resetting (ignore button noise)
+    inline bool guideEnabled = false;
     inline std::vector<Action> actions;
     inline size_t idx = 0;
     inline bool injecting = false;
@@ -204,10 +210,23 @@ namespace M {
         return false;
     }
 
+    // one place that records a click/release (from handleButton OR directly from PlayerObject)
+    inline void recordEvent(PlayLayer* pl, bool down, bool p2) {
+        if (!ready || !recording() || injecting || inReset) return;
+        if (!pl || !pl->m_player1 || pl->m_player1->m_isDead) return;
+        if (down == lastDown(p2)) return; // ignore duplicate press / duplicate release
+        actions.push_back({
+            (double)pl->m_player1->getPositionX(),
+            (double)pl->getCurrentPercent(),
+            down,
+            p2
+        });
+    }
+
     inline void setMode(Mode m) {
-        if (mode == Mode::Record) save(); // leaving (or re-arming) a recording saves it first
+        if (recording()) save(); // leaving (or re-arming) a recording saves it first
         mode = m;
-        if (m == Mode::Record) {
+        if (m == Mode::Record || m == Mode::Transfer) {
             actions.clear();
             // new recording ALWAYS gets its own file - old macros are never overwritten
             std::string base = sanitize(macroName);
@@ -229,7 +248,7 @@ namespace M {
     // Reaching 100% (or beating the level) ends the recording: save it and switch to Off,
     // so restarting afterwards does NOT cut the recorded actions.
     inline void finishRecording(PlayLayer* pl) {
-        if (mode != Mode::Record) return;
+        if (!recording()) return;
         if (pl && pl->m_player1) {
             double x = pl->m_player1->getPositionX();
             double pct = pl->getCurrentPercent();
@@ -268,7 +287,7 @@ namespace M {
         failed = false;
         held[0] = held[1] = false;
 
-        if (mode == Mode::Record) {
+        if (recording()) {
             // practice mode: throw away everything recorded after the checkpoint we respawned at
             while (!actions.empty() && actions.back().x >= x - EPS) actions.pop_back();
             // the game releases buttons on respawn, so close any open hold
@@ -308,7 +327,152 @@ static void inject(GJBaseGameLayer* l, bool down, bool p2) {
     M::injecting = false;
 }
 
-#include "framewin.hpp"   // Frame Windows: analysis, HUD and popup (needs M:: and inject() above)
+// ---------------------------------------------------------------- record transfer: catch other macros' clicks
+// Some macro bots press the player directly instead of going through handleButton.
+// This catches those too (handleButton already counts them, so no double recording).
+static void macroDirect(PlayerObject* p, bool down, PlayerButton b) {
+    if (b != PlayerButton::Jump || M::btnDepth > 0) return;
+    auto pl = PlayLayer::get();
+    if (!pl || !M::ready || !M::recording()) return;
+    if (p == pl->m_player1) M::recordEvent(pl, down, false);
+    else if (p == pl->m_player2) M::recordEvent(pl, down, true);
+}
+
+class $modify(MacroPlayer, PlayerObject) {
+    bool pushButton(PlayerButton button) {
+        macroDirect(this, true, button);
+        return PlayerObject::pushButton(button);
+    }
+    bool releaseButton(PlayerButton button) {
+        macroDirect(this, false, button);
+        return PlayerObject::releaseButton(button);
+    }
+};
+
+// ---------------------------------------------------------------- guide mode (single-lane "piano tiles")
+namespace G {
+    constexpr float LANE_W = 54.f;
+    constexpr float LANE_H = 210.f;
+    constexpr float LANE_X = 6.f;
+    constexpr float LANE_Y = 58.f;
+    constexpr float HIT_Y = 40.f;      // the line where you must click / release
+    constexpr double LOOK = 720.0;     // level units shown above the hit line
+    constexpr double CUE = 45.0;       // units before an event when CLICK / RELEASE lights up
+}
+
+static void buildGuide(CCNode* parent) {
+    auto root = CCNode::create();
+    root->setID("macro-guide"_spr);
+    root->setPosition({G::LANE_X, G::LANE_Y});
+    root->setVisible(false);
+
+    auto draw = CCDrawNode::create();
+    draw->setID("g-draw");
+    root->addChild(draw);
+
+    auto cue = CCLabelBMFont::create("", "bigFont.fnt");
+    cue->setID("g-cue");
+    cue->setScale(.36f);
+    cue->setPosition({G::LANE_W / 2.f, G::HIT_Y / 2.f});
+    root->addChild(cue);
+
+    parent->addChild(root, 40);
+}
+
+// Works whenever a macro is loaded and Guide is on - whether the macro is playing the
+// attempt, skipping it ("play after attempts"), or the mode is Off.
+static void updateGuide(PlayLayer* pl) {
+    auto root = pl->m_uiLayer->getChildByID("macro-guide"_spr);
+    if (!root) return;
+
+    bool show = M::guideEnabled && M::ready && !M::recording()
+        && !M::actions.empty() && pl->m_player1;
+    root->setVisible(show);
+    if (!show) return;
+
+    auto draw = static_cast<CCDrawNode*>(root->getChildByID("g-draw"));
+    auto cue = static_cast<CCLabelBMFont*>(root->getChildByID("g-cue"));
+    if (!draw || !cue) return;
+
+    double px = pl->m_player1->getPositionX();
+    auto const& acts = M::actions;
+
+    // first action at/after the player
+    auto it = std::lower_bound(acts.begin(), acts.end(), px - M::EPS,
+        [](Action const& a, double v) { return a.x < v; });
+    size_t i = it - acts.begin();
+
+    // are we in the middle of a hold? (last Player 1 action before us was a press)
+    bool open = false;
+    double curStart = px;
+    for (size_t j = i; j-- > 0;) {
+        if (!acts[j].p2) {
+            open = acts[j].down;
+            curStart = acts[j].x;
+            break;
+        }
+    }
+
+    struct Tile { double a, b; };
+    std::vector<Tile> tiles;
+    for (size_t k = i; k < acts.size(); k++) {
+        auto const& a = acts[k];
+        if (a.p2) continue;
+        if (a.x > px + G::LOOK) break;
+        if (a.down) {
+            if (!open) { open = true; curStart = a.x; }
+        } else if (open) {
+            tiles.push_back({curStart, a.x});
+            open = false;
+        }
+    }
+    if (open) tiles.push_back({curStart, px + G::LOOK * 2.0});
+
+    // what should the player do right now?
+    std::string txt;
+    ccColor3B col = {255, 255, 255};
+    ccColor4F lineCol = ccc4f(1.f, 1.f, 1.f, .9f);
+    if (!tiles.empty()) {
+        auto const& t = tiles.front();
+        if (t.a <= px) {
+            if (t.b - px <= G::CUE) { txt = "RELEASE"; col = {255, 90, 90}; lineCol = ccc4f(1.f, .35f, .35f, 1.f); }
+            else { txt = "HOLD"; col = {90, 255, 120}; lineCol = ccc4f(.35f, 1.f, .5f, 1.f); }
+        } else if (t.a - px <= G::CUE) {
+            txt = "CLICK"; col = {255, 230, 80}; lineCol = ccc4f(1.f, .9f, .3f, 1.f);
+        }
+    }
+
+    draw->clear();
+    float W = G::LANE_W, H = G::LANE_H, HY = G::HIT_Y;
+
+    CCPoint bg[4] = {ccp(0, 0), ccp(W, 0), ccp(W, H), ccp(0, H)};
+    draw->drawPolygon(bg, 4, ccc4f(0.f, 0.f, 0.f, .45f), 1.f, ccc4f(1.f, 1.f, 1.f, .35f));
+
+    float scale = (H - HY - 8.f) / (float)G::LOOK;
+    for (auto const& t : tiles) {
+        float ya = HY + (float)((t.a - px) * scale);
+        float yb = HY + (float)((t.b - px) * scale);
+        ya = std::max(ya, HY);
+        yb = std::min(yb, H - 4.f);
+        if (ya >= H - 4.f) continue;
+        if (yb - ya < 7.f) yb = std::min(ya + 7.f, H - 4.f); // taps stay visible
+        bool holding = t.a <= px;
+        CCPoint poly[4] = {ccp(5, ya), ccp(W - 5, ya), ccp(W - 5, yb), ccp(5, yb)};
+        draw->drawPolygon(poly, 4,
+            holding ? ccc4f(.2f, .9f, .4f, .95f) : ccc4f(.3f, .8f, 1.f, .9f),
+            1.f, ccc4f(1.f, 1.f, 1.f, .8f));
+    }
+
+    CCPoint hit[4] = {ccp(0, HY - 2), ccp(W, HY - 2), ccp(W, HY + 2), ccp(0, HY + 2)};
+    draw->drawPolygon(hit, 4, lineCol, 0.f, ccc4f(0.f, 0.f, 0.f, 0.f));
+
+    static std::string lastTxt;
+    if (txt != lastTxt) {
+        lastTxt = txt;
+        cue->setString(txt.c_str());
+    }
+    cue->setColor(col);
+}
 
 // ---------------------------------------------------------------- recording / playback
 class $modify(MacroGJ, GJBaseGameLayer) {
@@ -319,24 +483,14 @@ class $modify(MacroGJ, GJBaseGameLayer) {
             // while the macro is playing, ignore real clicks so nothing desyncs
             if (M::mode == Mode::Play && M::active) return;
 
-            if (M::mode == Mode::Record && m_player1 && !m_player1->m_isDead) {
-                M::actions.push_back({
-                    (double)m_player1->getPositionX(),
-                    (double)pl->getCurrentPercent(),
-                    down,
-                    !isPlayer1
-                });
-            }
+            M::recordEvent(pl, down, !isPlayer1);
         }
+        M::btnDepth++;
         GJBaseGameLayer::handleButton(down, button, isPlayer1);
+        M::btnDepth--;
     }
 
     void processCommands(float dt, bool isHalfTick, bool isLastTick) {
-        if (FW::R.active) {   // Frame Windows analysis: its own click injection replaces the macro player
-            FW::onCommands(this, isHalfTick);
-            GJBaseGameLayer::processCommands(dt, isHalfTick, isLastTick);
-            return;
-        }
         auto pl = PlayLayer::get();
         auto self = static_cast<GJBaseGameLayer*>(this);
         bool playing = M::ready && pl && static_cast<GJBaseGameLayer*>(pl) == self
@@ -362,7 +516,6 @@ class $modify(MacroGJ, GJBaseGameLayer) {
                 while (M::idx < M::actions.size() && x >= M::actions[M::idx].x - M::EPS) {
                     auto a = M::actions[M::idx];
                     inject(self, a.down, a.p2);
-                    FW::onFire(M::idx);
                     M::idx++;
                 }
             }
@@ -383,7 +536,7 @@ class $modify(MacroPL, PlayLayer) {
         M::macroName.clear();
 
         M::actions.clear();
-        if (M::mode != Mode::Record) {
+        if (!M::recording()) {
             // load the macro this level used last, else the default one
             std::string last = Mod::get()->getSavedValue<std::string>("last-" + M::levelKey, M::levelKey);
             if (M::load(last)) {
@@ -410,21 +563,22 @@ class $modify(MacroPL, PlayLayer) {
         label->setAnchorPoint({0.f, 1.f});
         label->setPosition({6.f, win.height - 6.f});
         m_uiLayer->addChild(label, 50);
-        FW::attachHUD(this);
+        buildGuide(m_uiLayer);
         return true;
     }
 
     void resetLevel() {
+        M::inReset = true;
         PlayLayer::resetLevel();
+        M::inReset = false;
         M::onReset(this);
     }
 
     void postUpdate(float dt) {
         PlayLayer::postUpdate(dt);
-        FW::updateHUD(this, dt);
 
         // reached 100% while recording -> stop recording automatically
-        if (M::ready && M::mode == Mode::Record && m_player1 && !m_player1->m_isDead
+        if (M::ready && M::recording() && m_player1 && !m_player1->m_isDead
             && getCurrentPercent() >= 100.f) {
             M::finishRecording(this);
         }
@@ -434,8 +588,8 @@ class $modify(MacroPL, PlayLayer) {
 
         std::string s;
         if (Mod::get()->getSettingValue<bool>("show-status")) {
-            if (M::mode == Mode::Record) {
-                s = fmt::format("REC - {} actions", M::actions.size());
+            if (M::recording()) {
+                s = fmt::format("{} - {} actions", M::mode == Mode::Record ? "REC" : "TRANSFER", M::actions.size());
             } else if (M::mode == Mode::Play) {
                 if (M::active) {
                     s = M::failed ? fmt::format("PLAY - stopped at {}% (fail)", M::diePercent)
@@ -446,6 +600,8 @@ class $modify(MacroPL, PlayLayer) {
                 if (M::dieEnabled && !M::failed) s += fmt::format("  |  DIE @ {}%", M::diePercent);
             }
         }
+        updateGuide(this);
+
         static std::string last;
         if (s != last) {
             last = s;
@@ -454,13 +610,12 @@ class $modify(MacroPL, PlayLayer) {
     }
 
     void levelComplete() {
-        if (FW::onLevelComplete()) return;
         M::finishRecording(this);
         PlayLayer::levelComplete();
     }
 
     void onQuit() {
-        if (M::mode == Mode::Record) M::save();
+        if (M::recording()) M::save();
         M::ready = false;
         M::levelKey.clear();
         PlayLayer::onQuit();
@@ -669,7 +824,7 @@ protected:
     CCLabelBMFont* m_infoLabel = nullptr;
 
     void refresh() {
-        char const* names[] = {"Off", "Recording", "Playing"};
+        char const* names[] = {"Off", "Recording", "Playing", "Transfer"};
         m_modeLabel->setString(fmt::format("Mode: {}", names[(int)M::mode]).c_str());
         m_infoLabel->setString(fmt::format("{} actions", M::actions.size()).c_str());
     }
@@ -677,8 +832,10 @@ protected:
     void applyMode(Mode m) {
         M::setMode(m);
         refresh();
-        if (m == Mode::Record) {
-            M::notify(fmt::format("Recording as '{}' - restart the level", M::fileBase()), NotificationIcon::Success);
+        if (m == Mode::Record || m == Mode::Transfer) {
+            M::notify(fmt::format("{} as '{}' - restart the level",
+                m == Mode::Record ? "Recording" : "Transfer recording (start the other macro)", M::fileBase()),
+                NotificationIcon::Success);
         } else if (m == Mode::Play) {
             M::notify("Macro ready - restart the level", NotificationIcon::Success);
         }
@@ -690,17 +847,35 @@ protected:
 
         // ---- mode buttons
         auto addMode = [this](char const* text, Mode m, float x) {
-            auto spr = ButtonSprite::create(text, 80, true, "bigFont.fnt", "GJ_button_01.png", 30.f, .6f);
+            auto spr = ButtonSprite::create(text, 76, true, "bigFont.fnt", "GJ_button_01.png", 30.f, .5f);
             auto btn = CCMenuItemExt::createSpriteExtra(spr, [this, m](CCObject*) { this->applyMode(m); });
             m_buttonMenu->addChildAtPosition(btn, Anchor::Center, {x, 90.f});
         };
-        addMode("Off", Mode::Off, -100.f);
-        addMode("Record", Mode::Record, 0.f);
-        addMode("Play", Mode::Play, 100.f);
+        addMode("Off", Mode::Off, -126.f);
+        addMode("Record", Mode::Record, -42.f);
+        addMode("Play", Mode::Play, 42.f);
+        addMode("Transfer", Mode::Transfer, 126.f);
+
+        // ---- guide mode toggle
+        auto guideToggle = CCMenuItemExt::createToggler(
+            CCSprite::createWithSpriteFrameName("GJ_checkOn_001.png"),
+            CCSprite::createWithSpriteFrameName("GJ_checkOff_001.png"),
+            [](CCMenuItemToggler* t) {
+                M::guideEnabled = !t->isToggled();
+                Mod::get()->setSavedValue("guide-enabled", M::guideEnabled);
+            });
+        guideToggle->setScale(.7f);
+        guideToggle->toggle(M::guideEnabled);
+        m_buttonMenu->addChildAtPosition(guideToggle, Anchor::Center, {-145.f, 58.f});
+
+        auto guideLabel = CCLabelBMFont::create("Guide mode", "bigFont.fnt");
+        guideLabel->setScale(.4f);
+        guideLabel->setAnchorPoint({0.f, .5f});
+        m_mainLayer->addChildAtPosition(guideLabel, Anchor::Center, {-125.f, 58.f});
 
         m_modeLabel = CCLabelBMFont::create("", "goldFont.fnt");
         m_modeLabel->setScale(.6f);
-        m_mainLayer->addChildAtPosition(m_modeLabel, Anchor::Center, {0.f, 58.f});
+        m_mainLayer->addChildAtPosition(m_modeLabel, Anchor::Center, {85.f, 58.f});
 
         // ---- die at percent
         auto dieToggle = CCMenuItemExt::createToggler(
@@ -853,7 +1028,6 @@ class $modify(MacroPause, PauseLayer) {
         menu->setID("macro-menu"_spr);
         menu->setPosition({win.width - 48.f, 24.f});
         menu->addChild(btn);
-        menu->addChild(FW::makePauseButton());   // "Windows" button, just above "Macro"
         this->addChild(menu, 100);
     }
 };
@@ -866,5 +1040,5 @@ $on_mod(Loaded) {
     M::useFolder = Mod::get()->getSavedValue<bool>("use-folder", false);
     M::folder = Mod::get()->getSavedValue<std::string>("folder", std::string());
     M::nextName = Mod::get()->getSavedValue<std::string>("next-macro", std::string());
-    FW::loadSettings();
+    M::guideEnabled = Mod::get()->getSavedValue<bool>("guide-enabled", false);
 }
